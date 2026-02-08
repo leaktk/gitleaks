@@ -22,7 +22,7 @@ var (
 	encodings = []*encoding{
 		{
 			kind:    percentKind,
-			pattern: `%[0-9A-Fa-f]{2}(?:.*%[0-9A-Fa-f]{2})?`,
+			pattern: `(?:%[0-9A-Fa-f]{2})+`,
 			decode:  decodePercent,
 		},
 		{
