@@ -8,41 +8,6 @@ import (
 	"github.com/zricethezav/gitleaks/v8/regexp"
 )
 
-var (
-	// encodingsRe is a regex built by combining all the encoding patterns
-	// into named capture groups so that a single pass can detect multiple
-	// encodings
-	encodingsRe *regexp.Regexp
-	// encodings contains all the encoding configurations for the detector.
-	// The precedence is important. You want more specific encodings to
-	// have a higher precedence or encodings that partially encode the
-	// values (e.g. percent) unlike encodings that fully encode the string
-	// (e.g. base64). If two encoding matches overlap the decoder will use
-	// this order to determine which encoding should wait till the next pass.
-	encodings = []*encoding{
-		{
-			kind:    percentKind,
-			pattern: `(?:%[0-9A-Fa-f]{2})+`,
-			decode:  decodePercent,
-		},
-		{
-			kind:    unicodeKind,
-			pattern: `(?:(?:U\+[a-fA-F0-9]{4}(?:\s|$))+|(?i)(?:\\{1,2}u[a-fA-F0-9]{4})+)`,
-			decode:  decodeUnicode,
-		},
-		{
-			kind:    hexKind,
-			pattern: `[0-9A-Fa-f]{32,}`,
-			decode:  decodeHex,
-		},
-		{
-			kind:    base64Kind,
-			pattern: `[\w\/+-]{16,}={0,2}`,
-			decode:  decodeBase64,
-		},
-	}
-)
-
 // encodingNames is used to map the encodingKinds to their name
 var encodingNames = []string{
 	"percent",
@@ -57,11 +22,86 @@ type encodingKind int
 
 var (
 	// make sure these go up by powers of 2
+	noKind      = encodingKind(0)
 	percentKind = encodingKind(1)
 	unicodeKind = encodingKind(2)
 	hexKind     = encodingKind(4)
 	base64Kind  = encodingKind(8)
 )
+
+// Anchors is a lookup table for anchors for the encodings. Any character
+// that is a valid first character for a supported encoding should be included
+// here with the kinds it is an anchor for for its values.
+var anchors = [256]encodingKind{
+	'%':  percentKind,
+	'+':  base64Kind,
+	'-':  base64Kind,
+	'/':  base64Kind,
+	'0':  base64Kind | hexKind,
+	'1':  base64Kind | hexKind,
+	'2':  base64Kind | hexKind,
+	'3':  base64Kind | hexKind,
+	'4':  base64Kind | hexKind,
+	'5':  base64Kind | hexKind,
+	'6':  base64Kind | hexKind,
+	'7':  base64Kind | hexKind,
+	'8':  base64Kind | hexKind,
+	'9':  base64Kind | hexKind,
+	'A':  base64Kind | hexKind,
+	'B':  base64Kind | hexKind,
+	'C':  base64Kind | hexKind,
+	'D':  base64Kind | hexKind,
+	'E':  base64Kind | hexKind,
+	'F':  base64Kind | hexKind,
+	'G':  base64Kind,
+	'H':  base64Kind,
+	'I':  base64Kind,
+	'J':  base64Kind,
+	'K':  base64Kind,
+	'L':  base64Kind,
+	'M':  base64Kind,
+	'N':  base64Kind,
+	'O':  base64Kind,
+	'P':  base64Kind,
+	'Q':  base64Kind,
+	'R':  base64Kind,
+	'S':  base64Kind,
+	'T':  base64Kind,
+	'U':  base64Kind | unicodeKind,
+	'V':  base64Kind,
+	'W':  base64Kind,
+	'X':  base64Kind,
+	'Y':  base64Kind,
+	'Z':  base64Kind,
+	'\\': unicodeKind,
+	'_':  base64Kind,
+	'a':  base64Kind | hexKind,
+	'b':  base64Kind | hexKind,
+	'c':  base64Kind | hexKind,
+	'd':  base64Kind | hexKind,
+	'e':  base64Kind | hexKind,
+	'f':  base64Kind | hexKind,
+	'g':  base64Kind,
+	'h':  base64Kind,
+	'i':  base64Kind,
+	'j':  base64Kind,
+	'k':  base64Kind,
+	'l':  base64Kind,
+	'm':  base64Kind,
+	'n':  base64Kind,
+	'o':  base64Kind,
+	'p':  base64Kind,
+	'q':  base64Kind,
+	'r':  base64Kind,
+	's':  base64Kind,
+	't':  base64Kind,
+	'u':  base64Kind,
+	'v':  base64Kind,
+	'w':  base64Kind,
+	'x':  base64Kind,
+	'y':  base64Kind,
+	'z':  base64Kind,
+}
 
 func (e encodingKind) String() string {
 	i := int(math.Log2(float64(e)))
@@ -158,4 +198,37 @@ func findEncodingMatches(data string) []encodingMatch {
 	}
 
 	return filtered
+}
+
+func findEncodingIndices(data string) {
+	var all []encodingMatch
+
+	for i := 0; i < len(data); i++ {
+		var se startEnd
+		kind := anchors[data[i]]
+
+		switch kind {
+		case noKind: 
+			continue
+		case percentKind:
+			se = tryPercent(i, data)
+		case unicodeKind:
+			se = tryUnicode(i, data)
+		case base64Kind:
+			se = tryBase64(i, data)
+		case base64Kind | hexKind:
+			// Always try hex before base64 since base64 is a superset 
+			// of hex characters. The chance of the characters being all
+			// valid hex characters and not base64 should be low
+			if se = tryHex(i, data); se.start == i {
+				kind = hexKind 
+			} else {
+				se = tryBase64(i, data)
+				kind = base64Kind
+			}
+		default:
+			// Should not get here unless there's a bug in the code
+			panic("invalid kind lookup: " + strconv.Itoa(int(kind)))
+		}
+	}
 }

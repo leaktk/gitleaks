@@ -21,14 +21,20 @@ func isPrintableASCII(b []byte) bool {
 	return true
 }
 
+// indexAny is like strings.IndexAny but takes a slice of
+// bools as a lookup
+func indexAny(data string, byteset []bool) int {
+	for i := 0; i < len(data); i++ {
+		if byteset[data[i]] {
+			return i
+		}
+	}
+	return -1
+}
+
 // hasByte can be used to check if a string has at least one of the provided
 // bytes. Note: make sure byteset is long enough to handle the largest byte in
 // the string.
 func hasByte(data string, byteset []bool) bool {
-	for i := 0; i < len(data); i++ {
-		if byteset[data[i]] {
-			return true
-		}
-	}
-	return false
+	return indexAny(data, byteset) != -1
 }
