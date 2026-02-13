@@ -38,3 +38,8 @@ func indexAny(data string, byteset []bool) int {
 func hasByte(data string, byteset []bool) bool {
 	return indexAny(data, byteset) != -1
 }
+
+// isWhitespace checks if a character is \t\r\n\x20
+func isWhitespace(b byte) bool {
+	return b == ' ' || (b <= 13 && (1<<b)&((1<<9)|(1<<10)|(1<<13)) != 0)
+}

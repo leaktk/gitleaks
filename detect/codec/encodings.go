@@ -1,11 +1,8 @@
 package codec
 
 import (
-	"fmt"
 	"math"
-	"strings"
-
-	"github.com/zricethezav/gitleaks/v8/regexp"
+	"strconv"
 )
 
 // encodingNames is used to map the encodingKinds to their name
@@ -21,7 +18,10 @@ var encodingNames = []string{
 type encodingKind int
 
 var (
-	// make sure these go up by powers of 2
+	// make sure these go up by powers of 2 and are in order of precedence
+	// when two encodings "touch" each other. If two encodings touch or overlap,
+	// the lower number here wins out as a way to handle things like percent encodings
+	// in base64 etc (e.g. aGVsbG8%3D).
 	noKind      = encodingKind(0)
 	percentKind = encodingKind(1)
 	unicodeKind = encodingKind(2)
@@ -138,69 +138,10 @@ type encoding struct {
 	pattern string
 	// take the match and return the decoded value
 	decode func(string) string
-	// determine which encoding should win out when two overlap
-	precedence int
-}
-
-func init() {
-	count := len(encodings)
-	namedPatterns := make([]string, count)
-	for i, encoding := range encodings {
-		encoding.precedence = count - i
-		namedPatterns[i] = fmt.Sprintf(
-			"(?P<%s>%s)",
-			encoding.kind,
-			encoding.pattern,
-		)
-	}
-	encodingsRe = regexp.MustCompile(strings.Join(namedPatterns, "|"))
 }
 
 // findEncodingMatches finds as many encodings as it can for this pass
 func findEncodingMatches(data string) []encodingMatch {
-	var all []encodingMatch
-	for _, matchIndex := range encodingsRe.FindAllStringSubmatchIndex(data, -1) {
-		// Add the encodingMatch with its proper encoding
-		for i, j := 2, 0; i < len(matchIndex); i, j = i+2, j+1 {
-			if matchIndex[i] > -1 {
-				all = append(all, encodingMatch{
-					encoding: encodings[j],
-					startEnd: startEnd{
-						start: matchIndex[i],
-						end:   matchIndex[i+1],
-					},
-				})
-			}
-		}
-	}
-
-	totalMatches := len(all)
-	if totalMatches == 1 {
-		return all
-	}
-
-	// filter out lower precedence ones that overlap their neigbors
-	filtered := make([]encodingMatch, 0, len(all))
-	for i, m := range all {
-		if i > 0 {
-			prev := all[i-1]
-			if m.overlaps(prev.startEnd) && prev.encoding.precedence > m.encoding.precedence {
-				continue // skip this one
-			}
-		}
-		if i+1 < totalMatches {
-			next := all[i+1]
-			if m.overlaps(next.startEnd) && next.encoding.precedence > m.encoding.precedence {
-				continue // skip this one
-			}
-		}
-		filtered = append(filtered, m)
-	}
-
-	return filtered
-}
-
-func findEncodingIndices(data string) {
 	var all []encodingMatch
 
 	for i := 0; i < len(data); i++ {
@@ -208,7 +149,7 @@ func findEncodingIndices(data string) {
 		kind := anchors[data[i]]
 
 		switch kind {
-		case noKind: 
+		case noKind:
 			continue
 		case percentKind:
 			se = tryPercent(i, data)
@@ -216,12 +157,20 @@ func findEncodingIndices(data string) {
 			se = tryUnicode(i, data)
 		case base64Kind:
 			se = tryBase64(i, data)
+		case base64Kind | unicodeKind:
+			// Try unicode first since it's more specific (requires U+XXXX)
+			if se = tryUnicode(i, data); se.start == i {
+				kind = unicodeKind
+			} else {
+				se = tryBase64(i, data)
+				kind = base64Kind
+			}
 		case base64Kind | hexKind:
-			// Always try hex before base64 since base64 is a superset 
+			// Always try hex before base64 since base64 is a superset
 			// of hex characters. The chance of the characters being all
 			// valid hex characters and not base64 should be low
 			if se = tryHex(i, data); se.start == i {
-				kind = hexKind 
+				kind = hexKind
 			} else {
 				se = tryBase64(i, data)
 				kind = base64Kind
@@ -230,5 +179,210 @@ func findEncodingIndices(data string) {
 			// Should not get here unless there's a bug in the code
 			panic("invalid kind lookup: " + strconv.Itoa(int(kind)))
 		}
+
+		// If no match found, skip ahead to the position indicated by se.end
+		if se.start == -1 {
+			i = se.end - 1 // -1 because loop will increment
+			continue
+		}
+
+		// Create the encoding
+		var enc encoding
+
+		switch kind {
+		case percentKind:
+			enc = encoding{kind: kind, decode: decodePercent}
+		case unicodeKind:
+			enc = encoding{kind: kind, decode: decodeUnicode}
+		case hexKind:
+			enc = encoding{kind: kind, decode: decodeHex}
+		case base64Kind:
+			enc = encoding{kind: kind, decode: decodeBase64}
+		default:
+			panic("could not resolve decoding; likely a missing coding wired up here")
+		}
+
+		all = append(all, encodingMatch{
+			encoding: &enc,
+			startEnd: se,
+		})
+
+		// Skip to end of this match
+		i = se.end - 1 // -1 because loop will increment
 	}
+
+	allLen := len(all)
+	filtered := make([]encodingMatch, 0, allLen)
+	for i, m := range all {
+		if i > 0 {
+			prev := all[i-1]
+			if m.overlaps(prev.startEnd) && prev.encoding.kind < m.encoding.kind {
+				continue // skip this one
+			}
+		}
+
+		if i+1 < allLen {
+			next := all[i+1]
+			if m.overlaps(next.startEnd) && next.encoding.kind < m.encoding.kind {
+				continue // skip this one
+			}
+		}
+
+		filtered = append(filtered, m)
+	}
+
+	return filtered
+}
+
+func tryPercent(i int, data string) startEnd {
+	if i+3 > len(data) {
+		return startEnd{-1, len(data)}
+	}
+
+	start := i
+	for i+2 < len(data) && data[i] == '%' && hexMap[data[i+1]]|hexMap[data[i+2]] != '\xff' {
+		i += 3
+	}
+
+	if start == i {
+		return startEnd{-1, i + 1}
+	}
+
+	return startEnd{start, i}
+}
+
+func tryUnicode(i int, data string) startEnd {
+	if i+6 > len(data) {
+		// -1 to indicate no match, len(data) to indicate where it checked to for potential fast forwarding
+		return startEnd{-1, len(data)}
+	}
+
+	start := i
+
+	for i+5 < len(data) {
+		switch data[i] {
+		case '\\':
+			// offset for skiping extra slashes
+			o := i + 1
+			for o+4 < len(data) && data[o] == '\\' {
+				o++
+			}
+
+			// invalid hex values are set to 0xff (255); the max all valid chars could get to is 60
+			if data[o]|32 == 'u' && hexMap[data[o+1]]|hexMap[data[o+1]]|hexMap[data[o+3]]|hexMap[data[o+4]] != '\xff' {
+				i = o + 5
+			} else {
+				break
+			}
+		case 'U':
+			// invalid values are set to 0xff (255); the max all valid chars could get to is 60
+			if data[i+1] == '+' {
+				if hexMap[data[i+2]]|hexMap[data[i+3]]|hexMap[data[i+4]]|hexMap[data[i+5]] != '\xff' {
+					if i+6 == len(data) {
+						i += 6
+					} else if isWhitespace(data[i+6]) {
+						i += 7
+					}
+				} else {
+					break
+				}
+			}
+		}
+	}
+
+	if start == i {
+		return startEnd{-1, i + 1}
+	}
+
+	return startEnd{start, i}
+}
+
+func tryBase64(i int, data string) startEnd {
+	// Require at least 16 base64 characters to minimize false positives
+	if i+16 > len(data) {
+		return startEnd{-1, len(data)}
+	}
+
+	// Find the end of the base64 run
+	end := i + 1
+	for end < len(data) && base64Map[data[end]] != 0xff {
+		end++
+	}
+
+	// Check if we found at least 16 characters
+	if end-i < 16 {
+		return startEnd{-1, end}
+	}
+
+	// Check for padding characters and include them
+	for end < len(data) && data[end] == '=' {
+		end++
+	}
+
+	return startEnd{i, end}
+}
+
+func tryHex(i int, data string) startEnd {
+	// Require at least 32 hex characters
+	if i+32 > len(data) {
+		return startEnd{-1, len(data)}
+	}
+
+	// Check first 32 characters - unrolled in blocks of 8 for better performance
+	// Accumulate OR of all lookups - if any are invalid (0xff), the result will contain 0xff
+	var acc byte
+
+	// Block 1: chars 0-7
+	acc |= hexMap[data[i+0]]
+	acc |= hexMap[data[i+1]]
+	acc |= hexMap[data[i+2]]
+	acc |= hexMap[data[i+3]]
+	acc |= hexMap[data[i+4]]
+	acc |= hexMap[data[i+5]]
+	acc |= hexMap[data[i+6]]
+	acc |= hexMap[data[i+7]]
+
+	// Block 2: chars 8-15
+	acc |= hexMap[data[i+8]]
+	acc |= hexMap[data[i+9]]
+	acc |= hexMap[data[i+10]]
+	acc |= hexMap[data[i+11]]
+	acc |= hexMap[data[i+12]]
+	acc |= hexMap[data[i+13]]
+	acc |= hexMap[data[i+14]]
+	acc |= hexMap[data[i+15]]
+
+	// Block 3: chars 16-23
+	acc |= hexMap[data[i+16]]
+	acc |= hexMap[data[i+17]]
+	acc |= hexMap[data[i+18]]
+	acc |= hexMap[data[i+19]]
+	acc |= hexMap[data[i+20]]
+	acc |= hexMap[data[i+21]]
+	acc |= hexMap[data[i+22]]
+	acc |= hexMap[data[i+23]]
+
+	// Block 4: chars 24-31
+	acc |= hexMap[data[i+24]]
+	acc |= hexMap[data[i+25]]
+	acc |= hexMap[data[i+26]]
+	acc |= hexMap[data[i+27]]
+	acc |= hexMap[data[i+28]]
+	acc |= hexMap[data[i+29]]
+	acc |= hexMap[data[i+30]]
+	acc |= hexMap[data[i+31]]
+
+	// If any character was invalid, acc will have 0xff bits set
+	if acc == 0xff {
+		// don't skip ahead here because it could be base64 still
+		return startEnd{-1, i}
+	}
+
+	// Found valid 32-char run, now continue until we hit a non-hex character
+	end := i + 32
+	for end < len(data) && hexMap[data[end]] != 0xff {
+		end++
+	}
+
+	return startEnd{i, end}
 }
